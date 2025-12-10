@@ -361,27 +361,19 @@ def train_unpaired(
     )
 
     # Initialize models
+    # Single initialization — removed accidental duplicates
     G = PerPixelAffineNet(base_ch=32).to(device)  # digital -> film
     F = PerPixelAffineNet(base_ch=32).to(device)  # film -> digital
     GrainNet = GrainEstimator().to(device)  # film grain estimator
     D_film = PatchDiscriminator().to(device)
     D_dig = PatchDiscriminator().to(device)
-    G = PerPixelAffineNet(base_ch=32).to(device)  # digital -> film
-    F = PerPixelAffineNet(base_ch=32).to(device)  # film -> digital
-    D_film = PatchDiscriminator().to(device)
-    D_dig = PatchDiscriminator().to(device)
 
     # Optimizers
+    # Generator optimizer includes GrainNet so grain weights are updated with the generators
     g_optimizer = torch.optim.Adam(
         list(G.parameters()) + list(F.parameters()) + list(GrainNet.parameters()),
         lr=lr,
         betas=(0.5, 0.999),
-    )
-    d_optimizer = torch.optim.Adam(
-        list(D_film.parameters()) + list(D_dig.parameters()), lr=lr, betas=(0.5, 0.999)
-    )
-    g_optimizer = torch.optim.Adam(
-        list(G.parameters()) + list(F.parameters()), lr=lr, betas=(0.5, 0.999)
     )
     d_optimizer = torch.optim.Adam(
         list(D_film.parameters()) + list(D_dig.parameters()), lr=lr, betas=(0.5, 0.999)
@@ -432,12 +424,9 @@ def train_unpaired(
             )
 
             # Predict learned grain pattern (trained on real film)
-            fake_film_base = torch.clamp(
-                apply_perpixel_affine(tmap_g, real_dig), 0.0, 1.0
-            )
-
             grain_map = GrainNet(fake_film_base)
 
+            # Add grain as a residual (small magnitude) and clamp to valid range
             fake_film = torch.clamp(fake_film_base + 0.1 * grain_map, 0.0, 1.0)
 
             tmap_f = F(real_film)  # transform maps for film->digital
@@ -479,6 +468,25 @@ def train_unpaired(
             d_optimizer.step()
 
             # ------------------- Generator update -------------------
+
+            # ---- Smoothness regularization for affine maps ----
+            def smoothness_loss(tmap):
+                return torch.nn.functional.l1_loss(
+                    tmap[:, :, :-1, :], tmap[:, :, 1:, :]
+                ) + torch.nn.functional.l1_loss(tmap[:, :, :, :-1], tmap[:, :, :, 1:])
+
+            # ---- High-pass filter to constrain grain to HF only ----
+            hp_kernel = torch.tensor(
+                [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
+                dtype=torch.float32,
+                device=device,
+            ).view(1, 1, 3, 3)
+            if "grain_map" in locals():
+                grain_hp = torch.nn.functional.conv2d(grain_map, hp_kernel, padding=1)
+                grain_lp = grain_map - grain_hp
+                loss_grain_reg = torch.mean(grain_lp**2)
+            else:
+                loss_grain_reg = torch.tensor(0.0, device=device)
             g_optimizer.zero_grad()
 
             # Adversarial loss for generators (try to fool discriminators)
@@ -528,12 +536,19 @@ def train_unpaired(
                 ) * 0.5
 
             # Compose final generator loss
+            loss_smooth = smoothness_loss(tmap_g) + smoothness_loss(tmap_f)
+
+            grain_weight = 0.02  # reduced grain strength
+
+            # ---- FINAL GENERATOR LOSS (fixed) ----
             loss_g = (
                 loss_g_adv_film
                 + loss_f_adv_dig
                 + lambda_cycle * loss_cycle
                 + lambda_id * loss_id
                 + 0.1 * loss_perc
+                + 0.1 * loss_smooth
+                + 0.05 * loss_grain_reg
             )
 
             loss_g.backward()
@@ -635,7 +650,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--device", type=str, default="mps")
     parser.add_argument("--model", type=str, default="best_model_G.pth")
-    parser.add_argument("--src", type=str, default="./digital")
+    parser.add_argument("--src", type=str, default="./digi")
     parser.add_argument("--out", type=str, default="./out")
     parser.add_argument(
         "--fast_debug",
