@@ -493,6 +493,7 @@ def train_unpaired(
     }
 
     best_val_loss = float("inf")
+    best_lpips_score = float("inf")
     patience_counter = 0
     patience_limit = 10
 
@@ -702,8 +703,8 @@ def train_unpaired(
                     rec_film = torch.clamp(
                         apply_perpixel_affine(rec_tmap2, fake_dig), 0.0, 1.0
                     )
-                    rec_grain = GrainNet(rec_film_base)
-                    rec_film = torch.clamp(rec_film_base + 0.05 * rec_grain, 0.0, 1.0)
+
+                    rec_film = torch.clamp(rec_film_base, 0.0, 1.0)
 
                     if lpips_metric is not None:
                         lpips_d2f = lpips_metric.compute(val_dig, fake_film)
