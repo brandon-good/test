@@ -278,7 +278,7 @@ class PerceptualLoss(nn.Module):
 
     def __init__(self, device="cpu"):
         super().__init__()
-        vgg = models.vgg16(pretrained=True).features
+        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
         self.slice = nn.Sequential(*list(vgg.children())[:16]).eval().to(device)
         for p in self.slice.parameters():
             p.requires_grad = False
@@ -311,7 +311,7 @@ def train_unpaired(
     lr=2e-4,
     device="mps",
     lambda_cycle=10.0,
-    lambda_id=5.0,
+    lambda_id=0.1,
     use_perc=False,
 ):
     """
@@ -366,22 +366,12 @@ def train_unpaired(
     GrainNet = GrainEstimator().to(device)  # film grain estimator
     D_film = PatchDiscriminator().to(device)
     D_dig = PatchDiscriminator().to(device)
-    G = PerPixelAffineNet(base_ch=32).to(device)  # digital -> film
-    F = PerPixelAffineNet(base_ch=32).to(device)  # film -> digital
-    D_film = PatchDiscriminator().to(device)
-    D_dig = PatchDiscriminator().to(device)
 
     # Optimizers
     g_optimizer = torch.optim.Adam(
         list(G.parameters()) + list(F.parameters()) + list(GrainNet.parameters()),
         lr=lr,
         betas=(0.5, 0.999),
-    )
-    d_optimizer = torch.optim.Adam(
-        list(D_film.parameters()) + list(D_dig.parameters()), lr=lr, betas=(0.5, 0.999)
-    )
-    g_optimizer = torch.optim.Adam(
-        list(G.parameters()) + list(F.parameters()), lr=lr, betas=(0.5, 0.999)
     )
     d_optimizer = torch.optim.Adam(
         list(D_film.parameters()) + list(D_dig.parameters()), lr=lr, betas=(0.5, 0.999)
@@ -427,9 +417,6 @@ def train_unpaired(
             # ------------------- Generators forward -------------------
             # Predict per-pixel affine transforms, then apply to obtain images
             tmap_g = G(real_dig)  # transform maps for digital->film
-            fake_film_base = torch.clamp(
-                apply_perpixel_affine(tmap_g, real_dig), 0.0, 1.0
-            )
 
             # Predict learned grain pattern (trained on real film)
             fake_film_base = torch.clamp(
