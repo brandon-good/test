@@ -1,39 +1,48 @@
-#!/usr/bin/env python3
 """
-film_emulation_impl.py — Grain-free version
+film_emulation_impl.py
 
-This file is the cleaned, deduplicated, and grain-free variant of the
-film emulation training + inference script you provided.
+Unpaired training addition (Cycle-consistent training) for the
+"CNNs for Faithful Film Emulation" project.
 
-Changes:
-- Removed all film grain code (class, usage, losses, checkpoints).
-- Merged training loops into a single stable training function.
-b- Kept PerceptualLoss, identity/cycle/adversarial losses, schedulers, EMA, etc.
-- The 'apply' mode now performs only the per-pixel affine color/tone mapping.
-
-Usage examples:
-  Train:
-    python film_emulation_impl.py --mode train_unpaired --data ./dataset_root
-  Apply:
-    python film_emulation_impl.py --mode apply --model best_model_G.pth --src ./digital --out ./out
-  Eval LPIPS:
-    python film_emulation_impl.py --mode eval_lpips --model best_model_G.pth --model_f best_model_F.pth --data ./dataset_root --out ./out
+IMPROVEMENTS:
+- Fixed grain network integration into generation pipeline
+- Added learning rate scheduling
+- Improved memory efficiency with gradient checkpointing
+- Added validation loop and metrics tracking
+- Better checkpoint management with best model selection
+- Added data augmentation options
+- Improved grain modeling with multi-scale approach
+- Added exponential moving average (EMA) for stable inference
 """
 
+# ============================= Imports =============================
 import os
 import argparse
 from pathlib import Path
+import random
 import json
+from collections import deque
 import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as Ff  # functional API alias to avoid naming collisions with generator F
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 import torchvision.models as models
-import lpips
+from torch.cuda.amp import autocast, GradScaler
+
+# LPIPS for perceptual similarity
+try:
+    import lpips
+
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Warning: lpips not installed. Install with: pip install lpips")
+    print("LPIPS metrics will be disabled.")
+
 
 # ====================================================================
 #                           DATASETS
@@ -123,7 +132,9 @@ class ConvBlock(nn.Module):
         pad = ks // 2
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=ks, stride=stride, padding=pad),
-            nn.InstanceNorm2d(out_ch),
+            nn.InstanceNorm2d(
+                out_ch
+            ),  # Instance norm often works better than batch norm for style transfer
             nn.ReLU(inplace=True),
         )
 
@@ -132,17 +143,14 @@ class ConvBlock(nn.Module):
 
 
 class PerPixelAffineNet(nn.Module):
-    """U-Net-lite generator that outputs a 12-channel per-pixel affine map.
-
-    The 12 channels encode a 3x3 matrix (9 values) and a 3-vector bias per pixel.
-    """
+    """U-Net-lite generator with residual connections and improved architecture."""
 
     def __init__(self, base_ch=32):
         super().__init__()
         self.enc1 = ConvBlock(3, base_ch)
         self.enc2 = ConvBlock(base_ch, base_ch * 2)
         self.enc3 = ConvBlock(base_ch * 2, base_ch * 4)
-        self.enc4 = ConvBlock(base_ch * 4, base_ch * 8)
+        self.enc4 = ConvBlock(base_ch * 4, base_ch * 8)  # Added deeper layer
 
         self.bottleneck = nn.Sequential(
             ConvBlock(base_ch * 8, base_ch * 8),
@@ -161,17 +169,17 @@ class PerPixelAffineNet(nn.Module):
         # Initialize output layer to near-identity transform
         with torch.no_grad():
             self.out_conv.weight.zero_()
+            # Set bias to identity: [1,0,0, 0,1,0, 0,0,1, 0,0,0]
             identity_bias = torch.tensor(
                 [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], dtype=torch.float32
             )
-            if self.out_conv.bias is not None:
-                self.out_conv.bias.copy_(identity_bias)
+            self.out_conv.bias.copy_(identity_bias)
 
     def forward(self, x):
         e1 = self.enc1(x)
-        e2 = self.enc2(Ff.avg_pool2d(e1, 2))
-        e3 = self.enc3(Ff.avg_pool2d(e2, 2))
-        e4 = self.enc4(Ff.avg_pool2d(e3, 2))
+        e2 = self.enc2(F.avg_pool2d(e1, 2))
+        e3 = self.enc3(F.avg_pool2d(e2, 2))
+        e4 = self.enc4(F.avg_pool2d(e3, 2))
 
         b = self.bottleneck(e4)
 
@@ -246,6 +254,60 @@ def apply_perpixel_affine(
 
 
 # ====================================================================
+#                       FILM GRAIN MODEL (IMPROVED)
+# ====================================================================
+
+
+class MultiScaleGrainEstimator(nn.Module):
+    """Multi-scale grain estimator that captures both fine and coarse grain patterns.
+
+    This better mimics real film grain which has structure at multiple scales.
+    """
+
+    def __init__(self, in_ch=3, out_ch=1, base_ch=32):
+        super().__init__()
+
+        # Fine grain branch (high frequency)
+        self.fine_grain = nn.Sequential(
+            nn.Conv2d(in_ch + 1, base_ch, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, base_ch, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, out_ch, 1),
+        )
+
+        # Coarse grain branch (lower frequency, larger structures)
+        self.coarse_grain = nn.Sequential(
+            nn.Conv2d(in_ch + 1, base_ch, 5, 1, 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, base_ch, 5, 1, 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch, out_ch, 1),
+        )
+
+        # Learnable blend weight
+        self.blend = nn.Parameter(torch.tensor(0.7))  # Start favoring fine grain
+
+    def forward(self, x):
+        # Compute luminance channel
+        luminance = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+        # Grain is stronger in darker regions (inverse relationship with light)
+        grain_weight = (1.0 - luminance).clamp(0.1, 1.0)  # Prevent complete suppression
+
+        inp = torch.cat([x, luminance], dim=1)
+
+        fine = self.fine_grain(inp)
+        coarse = self.coarse_grain(inp)
+
+        # Blend fine and coarse grain
+        blend_weight = torch.sigmoid(self.blend)
+        grain = blend_weight * fine + (1 - blend_weight) * coarse
+
+        return grain * grain_weight
+
+
+# ====================================================================
 #                           LOSSES
 # ====================================================================
 
@@ -254,9 +316,25 @@ l1_criterion = nn.L1Loss()
 
 
 class LPIPSMetric:
-    """LPIPS perceptual similarity metric wrapper."""
+    """LPIPS perceptual similarity metric wrapper.
+
+    LPIPS (Learned Perceptual Image Patch Similarity) is a deep learning-based
+    metric that correlates better with human perception than traditional metrics
+    like PSNR or SSIM. Lower values = more similar images.
+
+    Reference: Zhang et al. "The Unreasonable Effectiveness of Deep Features
+    as a Perceptual Metric" (CVPR 2018)
+    """
 
     def __init__(self, net="alex", device="cpu"):
+        """
+        Args:
+            net: backbone network ('alex', 'vgg', or 'squeeze')
+                 'alex' (AlexNet) is fastest and recommended
+            device: torch device
+        """
+        if not LPIPS_AVAILABLE:
+            raise RuntimeError("lpips package not installed. Run: pip install lpips")
 
         self.loss_fn = lpips.LPIPS(net=net).to(device)
         self.loss_fn.eval()
@@ -265,6 +343,15 @@ class LPIPSMetric:
         self.device = device
 
     def compute(self, img1, img2):
+        """
+        Compute LPIPS distance between two images.
+
+        Args:
+            img1, img2: torch tensors of shape (B, 3, H, W) in range [0, 1]
+
+        Returns:
+            LPIPS distance (lower is better, 0 = identical)
+        """
         # LPIPS expects images in range [-1, 1]
         img1_normalized = img1 * 2.0 - 1.0
         img2_normalized = img2 * 2.0 - 1.0
@@ -275,6 +362,7 @@ class LPIPSMetric:
         return distance.mean().item()
 
     def compute_batch(self, img1, img2):
+        """Compute LPIPS for a batch, returning per-image scores."""
         img1_normalized = img1 * 2.0 - 1.0
         img2_normalized = img2 * 2.0 - 1.0
 
@@ -289,12 +377,7 @@ class PerceptualLoss(nn.Module):
 
     def __init__(self, device="cpu"):
         super().__init__()
-        # torchvision older/newer API differences: pretrained=True is common
-        vgg = (
-            models.vgg16(weights=models.VGG16_Weights.DEFAULT)
-            .features.eval()
-            .to(device)
-        )
+        vgg = models.vgg16(pretrained=True).features.eval().to(device)
 
         # Extract features from multiple layers
         self.slice1 = nn.Sequential(*list(vgg.children())[:4])  # relu1_2
@@ -360,7 +443,7 @@ class EMA:
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
+            if param.requires_grad:
                 param.data.copy_(self.backup[name])
 
 
@@ -386,7 +469,7 @@ def train_unpaired(
 
     if torch.backends.mps.is_available() and device == "mps":
         device = torch.device("mps")
-    elif torch.cuda.is_available() and device == "cuda":
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
@@ -394,11 +477,14 @@ def train_unpaired(
 
     # Transforms
     transform = transforms.Compose(
-        [ResizePreserveAR(max_size=512), transforms.ToTensor()]
+        [
+            ResizePreserveAR(max_size=512),
+            transforms.ToTensor(),
+        ]
     )
 
     digital_ds = UnpairedImageFolder(
-        os.path.join(data_root, "digi"), transform=transform, augment=use_augment
+        os.path.join(data_root, "digital"), transform=transform, augment=use_augment
     )
     film_ds = UnpairedImageFolder(
         os.path.join(data_root, "film"), transform=transform, augment=use_augment
@@ -440,6 +526,7 @@ def train_unpaired(
     # Initialize models
     G = PerPixelAffineNet(base_ch=32).to(device)
     F = PerPixelAffineNet(base_ch=32).to(device)
+    GrainNet = MultiScaleGrainEstimator().to(device)
     D_film = PatchDiscriminator().to(device)
     D_dig = PatchDiscriminator().to(device)
 
@@ -447,9 +534,9 @@ def train_unpaired(
     ema_G = EMA(G, decay=0.999)
     ema_F = EMA(F, decay=0.999)
 
-    # Optimizers with weight decay (no GrainNet parameters)
+    # Optimizers with weight decay
     g_optimizer = torch.optim.AdamW(
-        list(G.parameters()) + list(F.parameters()),
+        list(G.parameters()) + list(F.parameters()) + list(GrainNet.parameters()),
         lr=lr,
         betas=(0.5, 0.999),
         weight_decay=1e-4,
@@ -462,24 +549,22 @@ def train_unpaired(
     )
 
     # Learning rate schedulers
-    g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        g_optimizer, T_max=max(1, epochs)
-    )
-    d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        d_optimizer, T_max=max(1, epochs)
-    )
+    g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(g_optimizer, T_max=epochs)
+    d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(d_optimizer, T_max=epochs)
 
     perc = PerceptualLoss(device=device) if use_perc else None
 
+    # Initialize LPIPS metric
     lpips_metric = None
-    if compute_lpips:
+    if compute_lpips and LPIPS_AVAILABLE:
         try:
             lpips_metric = LPIPSMetric(net="alex", device=device)
             print("✓ LPIPS metric initialized (AlexNet backbone)")
         except Exception as e:
             print(f"Warning: Could not initialize LPIPS: {e}")
-            lpips_metric = None
+            compute_lpips = False
 
+    # Training history
     history = {
         "g_loss": [],
         "d_loss": [],
@@ -493,21 +578,23 @@ def train_unpaired(
     }
 
     best_val_loss = float("inf")
+    best_lpips_score = float("inf")
     patience_counter = 0
     patience_limit = 10
 
     for epoch in range(epochs):
         G.train()
         F.train()
+        GrainNet.train()
         D_film.train()
         D_dig.train()
 
         dig_iter = iter(digital_loader)
         film_iter = iter(film_loader)
 
-        epoch_g_loss = 0.0
-        epoch_d_loss = 0.0
-        epoch_cycle_loss = 0.0
+        epoch_g_loss = 0
+        epoch_d_loss = 0
+        epoch_cycle_loss = 0
 
         num_batches = min(len(digital_loader), len(film_loader))
 
@@ -526,13 +613,16 @@ def train_unpaired(
                 real_film = next(film_iter)
 
             real_dig = real_dig.to(device)
-            real_dig += 0.02 * torch.randn_like(real_dig)
             real_film = real_film.to(device)
-            real_film += 0.02 * torch.randn_like(real_film)
 
-            # =============== Generators Forward (produce fake images) ===============
+            # =============== Generators Forward ===============
             tmap_g = G(real_dig)
-            fake_film = torch.clamp(apply_perpixel_affine(tmap_g, real_dig), 0.0, 1.0)
+            fake_film_base = torch.clamp(
+                apply_perpixel_affine(tmap_g, real_dig), 0.0, 1.0
+            )
+
+            grain_map = GrainNet(fake_film_base)
+            fake_film = torch.clamp(fake_film_base + 0.05 * grain_map, 0.0, 1.0)
 
             tmap_f = F(real_film)
             fake_dig = torch.clamp(apply_perpixel_affine(tmap_f, real_film), 0.0, 1.0)
@@ -560,9 +650,9 @@ def train_unpaired(
                 pred_fake_dig, torch.zeros_like(pred_fake_dig)
             )
 
-            loss_d = 0.5 * (
+            loss_d = (
                 loss_d_real_film + loss_d_fake_film + loss_d_real_dig + loss_d_fake_dig
-            )
+            ) * 0.5
             loss_d.backward()
             d_optimizer.step()
 
@@ -586,10 +676,14 @@ def train_unpaired(
             loss_cycle_dig = l1_criterion(rec_dig, real_dig)
 
             rec_tmap2 = G(fake_dig)
-            rec_film = torch.clamp(apply_perpixel_affine(rec_tmap2, fake_dig), 0.0, 1.0)
+            rec_film_base = torch.clamp(
+                apply_perpixel_affine(rec_tmap2, fake_dig), 0.0, 1.0
+            )
+            rec_grain = GrainNet(rec_film_base)
+            rec_film = torch.clamp(rec_film_base + 0.05 * rec_grain, 0.0, 1.0)
             loss_cycle_film = l1_criterion(rec_film, real_film)
 
-            loss_cycle = 0.5 * (loss_cycle_dig + loss_cycle_film)
+            loss_cycle = (loss_cycle_dig + loss_cycle_film) * 0.5
 
             # Identity loss
             id_tmap_g = G(real_film)
@@ -600,7 +694,7 @@ def train_unpaired(
             id_f = torch.clamp(apply_perpixel_affine(id_tmap_f, real_dig), 0.0, 1.0)
             loss_id_f = l1_criterion(id_f, real_dig)
 
-            loss_id = 0.5 * (loss_id_g + loss_id_f)
+            loss_id = (loss_id_g + loss_id_f) * 0.5
 
             # Smoothness regularization
             def smoothness_loss(tmap):
@@ -613,25 +707,32 @@ def train_unpaired(
             # Perceptual loss
             loss_perc = torch.tensor(0.0, device=device)
             if perc is not None:
-                loss_perc = 0.5 * (
-                    perc(fake_film, real_film) + perc(fake_dig, real_dig)
+                loss_perc = (
+                    perc(fake_film, real_film) * 0.5 + perc(fake_dig, real_dig) * 0.5
                 )
 
+            # Grain regularization (encourage high-frequency only)
+            grain_freq_penalty = torch.mean(F.avg_pool2d(grain_map.abs(), 4) ** 2)
+
             # Total generator loss
-            loss_g_total = (
+            loss_g = (
                 loss_g_adv_film
                 + loss_f_adv_dig
                 + lambda_cycle * loss_cycle
                 + lambda_id * loss_id
                 + 0.1 * loss_perc
-                + 0.005 * loss_smooth
+                + 0.05 * loss_smooth
+                + 0.02 * grain_freq_penalty
             )
 
-            loss_g_total.backward()
+            loss_g.backward()
 
             # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(
-                list(G.parameters()) + list(F.parameters()), max_norm=1.0
+                list(G.parameters())
+                + list(F.parameters())
+                + list(GrainNet.parameters()),
+                max_norm=1.0,
             )
 
             g_optimizer.step()
@@ -641,14 +742,14 @@ def train_unpaired(
             ema_F.update()
 
             # Track losses
-            epoch_g_loss += loss_g_total.item()
+            epoch_g_loss += loss_g.item()
             epoch_d_loss += loss_d.item()
             epoch_cycle_loss += loss_cycle.item()
 
             if (it + 1) % 10 == 0:
                 print(
                     f"Epoch [{epoch+1}/{epochs}] Iter [{it+1}/{num_batches}] | "
-                    f"D: {loss_d.item():.4f} | G: {loss_g_total.item():.4f} | "
+                    f"D: {loss_d.item():.4f} | G: {loss_g.item():.4f} | "
                     f"Cycle: {loss_cycle.item():.4f} | ID: {loss_id.item():.4f}"
                 )
 
@@ -657,16 +758,17 @@ def train_unpaired(
         d_scheduler.step()
 
         # Record epoch averages
-        history["g_loss"].append(epoch_g_loss / max(1, num_batches))
-        history["d_loss"].append(epoch_d_loss / max(1, num_batches))
-        history["cycle_loss"].append(epoch_cycle_loss / max(1, num_batches))
+        history["g_loss"].append(epoch_g_loss / num_batches)
+        history["d_loss"].append(epoch_d_loss / num_batches)
+        history["cycle_loss"].append(epoch_cycle_loss / num_batches)
 
         # =============== Validation with LPIPS ===============
         if (epoch + 1) % val_interval == 0:
             G.eval()
             F.eval()
+            GrainNet.eval()
 
-            val_cycle_loss = 0.0
+            val_cycle_loss = 0
             lpips_dig2film_scores = []
             lpips_film2dig_scores = []
             lpips_cycle_dig_scores = []
@@ -680,9 +782,11 @@ def train_unpaired(
 
                     # Digital -> Film
                     tmap_g = G(val_dig)
-                    fake_film = torch.clamp(
+                    fake_film_base = torch.clamp(
                         apply_perpixel_affine(tmap_g, val_dig), 0.0, 1.0
                     )
+                    grain = GrainNet(fake_film_base)
+                    fake_film = torch.clamp(fake_film_base + 0.05 * grain, 0.0, 1.0)
 
                     # Film -> Digital
                     tmap_f = F(val_film)
@@ -699,27 +803,30 @@ def train_unpaired(
 
                     # Cycle: Film -> Digital -> Film
                     rec_tmap2 = G(fake_dig)
-                    rec_film = torch.clamp(
+                    rec_film_base = torch.clamp(
                         apply_perpixel_affine(rec_tmap2, fake_dig), 0.0, 1.0
                     )
                     rec_grain = GrainNet(rec_film_base)
                     rec_film = torch.clamp(rec_film_base + 0.05 * rec_grain, 0.0, 1.0)
 
+                    # Compute LPIPS metrics
                     if lpips_metric is not None:
+                        # LPIPS between digital and generated film
                         lpips_d2f = lpips_metric.compute(val_dig, fake_film)
                         lpips_dig2film_scores.append(lpips_d2f)
 
+                        # LPIPS between film and generated digital
                         lpips_f2d = lpips_metric.compute(val_film, fake_dig)
                         lpips_film2dig_scores.append(lpips_f2d)
 
+                        # LPIPS for cycle consistency (lower = better cycle)
                         lpips_cycle_d = lpips_metric.compute(val_dig, rec_dig)
                         lpips_cycle_dig_scores.append(lpips_cycle_d)
 
                         lpips_cycle_f = lpips_metric.compute(val_film, rec_film)
                         lpips_cycle_film_scores.append(lpips_cycle_f)
 
-            n_val = max(1, len(digital_val_loader))
-            val_cycle_loss /= n_val
+            val_cycle_loss /= len(digital_val_loader)
             history["val_cycle_loss"].append(val_cycle_loss)
 
             print(f"\n{'='*70}")
@@ -728,17 +835,17 @@ def train_unpaired(
             print(f"Cycle Loss (L1): {val_cycle_loss:.4f}")
 
             if lpips_metric is not None and len(lpips_dig2film_scores) > 0:
-                avg_lpips_d2f = float(np.mean(lpips_dig2film_scores))
-                avg_lpips_f2d = float(np.mean(lpips_film2dig_scores))
-                avg_lpips_cycle_d = float(np.mean(lpips_cycle_dig_scores))
-                avg_lpips_cycle_f = float(np.mean(lpips_cycle_film_scores))
+                avg_lpips_d2f = np.mean(lpips_dig2film_scores)
+                avg_lpips_f2d = np.mean(lpips_film2dig_scores)
+                avg_lpips_cycle_d = np.mean(lpips_cycle_dig_scores)
+                avg_lpips_cycle_f = np.mean(lpips_cycle_film_scores)
 
                 history["val_lpips_dig2film"].append(avg_lpips_d2f)
                 history["val_lpips_film2dig"].append(avg_lpips_f2d)
                 history["val_lpips_cycle_dig"].append(avg_lpips_cycle_d)
                 history["val_lpips_cycle_film"].append(avg_lpips_cycle_f)
 
-                print("LPIPS Perceptual Similarity (lower = more similar):")
+                print(f"\nLPIPS Perceptual Similarity (lower = more similar):")
                 print(f"  Digital -> Film:        {avg_lpips_d2f:.4f}")
                 print(f"  Film -> Digital:        {avg_lpips_f2d:.4f}")
                 print(
@@ -748,16 +855,20 @@ def train_unpaired(
                     f"  Cycle (Film):           {avg_lpips_cycle_f:.4f} ← (should be low)"
                 )
 
+                # Combined metric for best model selection
+                # Weight cycle consistency heavily since that's what preserves the original
                 combined_lpips = (avg_lpips_cycle_d + avg_lpips_cycle_f) * 2.0
-                print(f"Combined LPIPS Score:    {combined_lpips:.4f}")
 
+                print(f"\nCombined LPIPS Score:    {combined_lpips:.4f}")
+
+                # Update best model based on LPIPS cycle consistency
                 if combined_lpips < best_lpips_score:
                     best_lpips_score = combined_lpips
-                    print("✓ New best LPIPS score based on cycle consistency")
+                    print(f"✓ New best LPIPS score!")
 
-            print("=" * 70 + "")
+            print(f"{'='*70}\n")
 
-            # Save best L1 cycle model
+            # Save best model based on L1 cycle loss (primary metric)
             if val_cycle_loss < best_val_loss:
                 best_val_loss = val_cycle_loss
                 patience_counter = 0
@@ -767,6 +878,7 @@ def train_unpaired(
                 ema_F.apply_shadow()
                 torch.save(G.state_dict(), "best_model_G.pth")
                 torch.save(F.state_dict(), "best_model_F.pth")
+                torch.save(GrainNet.state_dict(), "best_model_Grain.pth")
                 ema_G.restore()
                 ema_F.restore()
 
@@ -783,11 +895,11 @@ def train_unpaired(
         if (epoch + 1) % 5 == 0:
             torch.save(
                 {
-                    "epoch": epoch + 1,
+                    "epoch": epoch,
                     "G": G.state_dict(),
                     "F": F.state_dict(),
+                    "GrainNet": GrainNet.state_dict(),
                     "g_opt": g_optimizer.state_dict(),
-                    "d_opt": d_optimizer.state_dict(),
                     "history": history,
                 },
                 f"checkpoint_epoch_{epoch+1}.pth",
@@ -800,33 +912,138 @@ def train_unpaired(
     print("\n✓ Training complete!")
     print(f"Best validation cycle loss: {best_val_loss:.4f}")
     if lpips_metric is not None:
-        print(f"Best LPIPS cycle score: {best_lpips_score:.4f}")
+        print(
+            f"Best LPIPS cycle score: {best_lpips_score:.4f}"
+            + list(GrainNet.parameters()),
+            max_norm=1.0,
+        )
+
+        g_optimizer.step()
+
+        # Update EMA
+        ema_G.update()
+        ema_F.update()
+
+        # Track losses
+        epoch_g_loss += loss_g.item()
+        epoch_d_loss += loss_d.item()
+        epoch_cycle_loss += loss_cycle.item()
+
+        if (it + 1) % 10 == 0:
+            print(
+                f"Epoch [{epoch+1}/{epochs}] Iter [{it+1}/{num_batches}] | "
+                f"D: {loss_d.item():.4f} | G: {loss_g.item():.4f} | "
+                f"Cycle: {loss_cycle.item():.4f} | ID: {loss_id.item():.4f}"
+            )
+
+        # Update learning rates
+        g_scheduler.step()
+        d_scheduler.step()
+
+        # Record epoch averages
+        history["g_loss"].append(epoch_g_loss / num_batches)
+        history["d_loss"].append(epoch_d_loss / num_batches)
+        history["cycle_loss"].append(epoch_cycle_loss / num_batches)
+
+        # =============== Validation ===============
+        if (epoch + 1) % val_interval == 0:
+            G.eval()
+            F.eval()
+            GrainNet.eval()
+
+            val_cycle_loss = 0
+            with torch.no_grad():
+                for val_dig, val_film in zip(digital_val_loader, film_val_loader):
+                    val_dig = val_dig.to(device)
+                    val_film = val_film.to(device)
+
+                    # Forward cycle
+                    tmap_g = G(val_dig)
+                    fake_film_base = torch.clamp(
+                        apply_perpixel_affine(tmap_g, val_dig), 0.0, 1.0
+                    )
+                    grain = GrainNet(fake_film_base)
+                    fake_film = torch.clamp(fake_film_base + 0.05 * grain, 0.0, 1.0)
+
+                    rec_tmap = F(fake_film)
+                    rec_dig = torch.clamp(
+                        apply_perpixel_affine(rec_tmap, fake_film), 0.0, 1.0
+                    )
+
+                    val_cycle_loss += l1_criterion(rec_dig, val_dig).item()
+
+            val_cycle_loss /= len(digital_val_loader)
+            history["val_cycle_loss"].append(val_cycle_loss)
+
+            print(
+                f"\n[Validation] Epoch {epoch+1} | Val Cycle Loss: {val_cycle_loss:.4f}\n"
+            )
+
+            # Save best model
+            if val_cycle_loss < best_val_loss:
+                best_val_loss = val_cycle_loss
+                patience_counter = 0
+
+                # Apply EMA weights for saving
+                ema_G.apply_shadow()
+                ema_F.apply_shadow()
+                torch.save(G.state_dict(), "best_model_G.pth")
+                torch.save(F.state_dict(), "best_model_F.pth")
+                torch.save(GrainNet.state_dict(), "best_model_Grain.pth")
+                ema_G.restore()
+                ema_F.restore()
+
+                print(f"✓ Saved new best models (val loss: {val_cycle_loss:.4f})")
+            else:
+                patience_counter += 1
+
+            # Early stopping
+            if patience_counter >= patience_limit:
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                break
+
+        # Save epoch checkpoints
+        if (epoch + 1) % 5 == 0:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "G": G.state_dict(),
+                    "F": F.state_dict(),
+                    "GrainNet": GrainNet.state_dict(),
+                    "g_opt": g_optimizer.state_dict(),
+                    "history": history,
+                },
+                f"checkpoint_epoch_{epoch+1}.pth",
+            )
+
+    # Save training history
+    with open("training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    print("\n✓ Training complete!")
+    print(f"Best validation cycle loss: {best_val_loss:.4f}")
 
 
 # ====================================================================
-#                           EVALUATION / INFERENCE
+#                           EVALUATION
 # ====================================================================
 
 
 def apply_trained_generator(
-    model_path, src_folder, out_folder, direction="G", device="mps"
+    model_path, grain_path, src_folder, out_folder, direction="G", device="mps"
 ):
-    """Apply trained generator (color-only) to all images in src_folder.
-
-    direction is kept for API compatibility; 'G' is digital->film.
-    """
-    if torch.backends.mps.is_available() and device == "mps":
-        device = torch.device("mps")
-    elif torch.cuda.is_available() and device == "cuda":
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
+    """Apply trained generator with grain to all images in src_folder."""
+    device = torch.device(device if torch.backends.mps.is_available() else "cpu")
     inv_to_pil = transforms.ToPILImage()
 
     model = PerPixelAffineNet(base_ch=32).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
+
+    grain_net = MultiScaleGrainEstimator().to(device)
+    if os.path.exists(grain_path):
+        grain_net.load_state_dict(torch.load(grain_path, map_location=device))
+    grain_net.eval()
 
     p = Path(src_folder)
     out_p = Path(out_folder)
@@ -850,7 +1067,13 @@ def apply_trained_generator(
         with torch.no_grad():
             tmap = model(inp)
             out_base = torch.clamp(apply_perpixel_affine(tmap, inp), 0, 1)
-            out = out_base  # Grain removed — only color/tone transform
+
+            # Add grain if it's film direction
+            if direction == "G":
+                grain = grain_net(out_base)
+                out = torch.clamp(out_base + 0.05 * grain, 0, 1)
+            else:
+                out = out_base
 
         out_img = inv_to_pil(out.squeeze(0).cpu())
 
@@ -863,7 +1086,7 @@ def apply_trained_generator(
         out_img = out_img.crop((left, top, right, bottom))
         out_img = out_img.resize((orig_w, orig_h), Image.BICUBIC)
 
-        out_img.save(out_p / img_path.name, quality=100)
+        out_img.save(out_p / img_path.name, quality=95)
         print(f"Processed: {img_path.name}")
 
     print(f"\n✓ Saved outputs to {out_p}")
@@ -877,6 +1100,7 @@ def apply_trained_generator(
 def evaluate_lpips_on_folder(
     model_g_path,
     model_f_path,
+    grain_path,
     digital_folder,
     film_folder,
     device="mps",
@@ -884,20 +1108,27 @@ def evaluate_lpips_on_folder(
     output_folder="./lpips_evaluation",
 ):
     """
-    LPIPS evaluation on paired samples between digital_folder and film_folder.
-    Grain is removed from evaluation — only color mapping is considered.
+    Comprehensive LPIPS evaluation on test sets.
+
+    Computes multiple LPIPS metrics:
+    - Digital -> Generated Film vs Real Film
+    - Film -> Generated Digital vs Real Digital
+    - Cycle consistency for both directions
+
+    Args:
+        model_g_path: Path to G model (digital->film)
+        model_f_path: Path to F model (film->digital)
+        grain_path: Path to grain model
+        digital_folder: Folder with digital images
+        film_folder: Folder with film images
+        save_comparisons: If True, saves visual comparisons
+        output_folder: Where to save results
     """
     if not LPIPS_AVAILABLE:
         print("Error: lpips package not installed. Run: pip install lpips")
         return
 
-    if torch.backends.mps.is_available() and device == "mps":
-        device = torch.device("mps")
-    elif torch.cuda.is_available() and device == "cuda":
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
+    device = torch.device(device if torch.backends.mps.is_available() else "cpu")
     print(f"Evaluating on device: {device}\n")
 
     # Load models
@@ -909,12 +1140,20 @@ def evaluate_lpips_on_folder(
     F.load_state_dict(torch.load(model_f_path, map_location=device))
     F.eval()
 
+    grain_net = MultiScaleGrainEstimator().to(device)
+    if os.path.exists(grain_path):
+        grain_net.load_state_dict(torch.load(grain_path, map_location=device))
+    grain_net.eval()
+
     # Initialize LPIPS
     lpips_metric = LPIPSMetric(net="alex", device=device)
 
     # Prepare data
     transform = transforms.Compose(
-        [ResizePreserveAR(max_size=512), transforms.ToTensor()]
+        [
+            ResizePreserveAR(max_size=512),
+            transforms.ToTensor(),
+        ]
     )
 
     digital_ds = UnpairedImageFolder(digital_folder, transform=transform)
@@ -950,9 +1189,11 @@ def evaluate_lpips_on_folder(
 
             # Digital -> Film
             tmap_g = G(digital_img)
-            fake_film = torch.clamp(
+            fake_film_base = torch.clamp(
                 apply_perpixel_affine(tmap_g, digital_img), 0.0, 1.0
             )
+            grain = grain_net(fake_film_base)
+            fake_film = torch.clamp(fake_film_base + 0.05 * grain, 0.0, 1.0)
 
             # Film -> Digital
             tmap_f = F(film_img)
@@ -967,9 +1208,11 @@ def evaluate_lpips_on_folder(
             )
 
             rec_tmap_f = G(fake_digital)
-            rec_film = torch.clamp(
+            rec_film_base = torch.clamp(
                 apply_perpixel_affine(rec_tmap_f, fake_digital), 0.0, 1.0
             )
+            rec_grain = grain_net(rec_film_base)
+            rec_film = torch.clamp(rec_film_base + 0.05 * rec_grain, 0.0, 1.0)
 
             # Compute LPIPS
             lpips_d2f = lpips_metric.compute(digital_img, fake_film)
@@ -978,8 +1221,8 @@ def evaluate_lpips_on_folder(
             lpips_cycle_f = lpips_metric.compute(film_img, rec_film)
 
             # Compute L1 for cycle consistency
-            l1_cycle_d = l1_criterion(rec_digital, digital_img).item()
-            l1_cycle_f = l1_criterion(rec_film, film_img).item()
+            l1_cycle_d = F.l1_loss(rec_digital, digital_img).item()
+            l1_cycle_f = F.l1_loss(rec_film, film_img).item()
 
             results["lpips_digital_to_film"].append(lpips_d2f)
             results["lpips_film_to_digital"].append(lpips_f2d)
@@ -1088,7 +1331,7 @@ def evaluate_lpips_on_folder(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Film Emulation (grain-free) with CycleGAN-style training and LPIPS evaluation"
+        description="Film Emulation with CycleGAN-style training and LPIPS evaluation"
     )
     parser.add_argument(
         "--data",
@@ -1124,6 +1367,12 @@ if __name__ == "__main__":
         help="Path to F model (film->digital) for eval_lpips",
     )
     parser.add_argument(
+        "--grain_model",
+        type=str,
+        default="best_model_Grain.pth",
+        help="Path to grain model for inference",
+    )
+    parser.add_argument(
         "--src", type=str, default="./digital", help="Source folder for inference"
     )
     parser.add_argument(
@@ -1135,7 +1384,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_perc", action="store_true", help="Disable perceptual loss"
     )
-
+    parser.add_argument(
+        "--no_lpips", action="store_true", help="Disable LPIPS metrics during training"
+    )
     parser.add_argument(
         "--lambda_cycle",
         type=float,
@@ -1175,10 +1426,12 @@ if __name__ == "__main__":
             use_perc=not args.no_perc,
             use_augment=not args.no_augment,
             val_interval=args.val_interval,
+            compute_lpips=not args.no_lpips,
         )
     elif args.mode == "apply":
         apply_trained_generator(
             model_path=args.model,
+            grain_path=args.grain_model,
             src_folder=args.src,
             out_folder=args.out,
             direction="G",
@@ -1191,6 +1444,7 @@ if __name__ == "__main__":
         evaluate_lpips_on_folder(
             model_g_path=args.model,
             model_f_path=args.model_f,
+            grain_path=args.grain_model,
             digital_folder=digital_test,
             film_folder=film_test,
             device=args.device,
